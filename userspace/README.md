@@ -2,6 +2,8 @@
 
 Userspace binaries are embedded into the kernel at build time and installed on the root tmpfs at boot.
 
+**Author:** typingreflexs — only error fixes assisted by Cursor.
+
 ## Quick build (init + sh)
 
 ```bash

@@ -1,3 +1,7 @@
+//! Per-CPU idle thread — polls UI input, network RX, DHCP, and browser load state.
+//!
+//! Runs forever on each CPU; BSP idle also updates the desktop clock via TSC.
+
 use crate::arch::x86_64::cpu;
 use crate::proc::{self, Tid};
 use crate::proc::id::Pid;

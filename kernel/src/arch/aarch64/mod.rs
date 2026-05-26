@@ -1,3 +1,5 @@
+//! ARM64 port stub — implements `Arch` trait; boot path not complete yet.
+
 pub mod entry;
 
 use crate::acpi::AcpiContext;

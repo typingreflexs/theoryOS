@@ -1,4 +1,15 @@
-//! Linear framebuffer graphics — desktop UI and user-space mapping.
+//! Linear framebuffer graphics — desktop UI, apps, and user-space fb mapping.
+//!
+//! # Submodules
+//! - `framebuffer` — Limine linear FB, pixel format, blit helpers
+//! - `desktop`     — Wallpaper, taskbar, clock
+//! - `apps`        — Window manager, launcher, click handling
+//! - `browser`     — Async HTTP page loader (text-only)
+//! - `shell`       — In-kernel terminal emulator
+//! - `draw` / `font` — Primitives and 8×16 bitmap font
+//! - `user_map`    — `/proc/fb` metadata for userspace mmap
+//!
+//! The idle thread calls `poll_input()` every iteration to handle keyboard/mouse.
 
 pub mod apps;
 pub mod browser;
@@ -18,6 +29,7 @@ pub use user_map::map_into_user;
 
 static FRAMEBUFFER: Once<Framebuffer> = Once::new();
 
+/// Initialize PS/2 input, framebuffer, apps, and draw the first frame.
 pub fn init() {
     crate::input::init();
     let Some(fb) = Framebuffer::from_boot() else {
@@ -41,6 +53,7 @@ pub fn is_available() -> bool {
     FRAMEBUFFER.get().is_some()
 }
 
+/// Poll keyboard/mouse and redraw if any app or the cursor changed.
 pub fn poll_input() {
     crate::input::poll_devices(|key| {
         match apps::focus() {
@@ -72,12 +85,14 @@ pub fn poll_input() {
     }
 }
 
+/// Update taskbar clock (called ~every 500 ms from idle loop).
 pub fn update_clock() {
     if let Some(fb) = FRAMEBUFFER.get() {
         desktop::update_clock(fb);
     }
 }
 
+/// One-line summary for `/proc/fb` (width, height, bpp, address).
 pub fn proc_fb_line() -> alloc::string::String {
     user_map::proc_fb_line()
 }

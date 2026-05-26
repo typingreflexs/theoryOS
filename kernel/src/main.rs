@@ -1,3 +1,8 @@
+//! Kernel binary entry — delegates to architecture-specific `kernel_entry`.
+//!
+//! Limine loads this ELF and jumps to `_start`, which calls into
+//! `arch::x86_64::entry` (or aarch64) to set up HHDM and call `kernel_main`.
+
 #![no_std]
 #![no_main]
 

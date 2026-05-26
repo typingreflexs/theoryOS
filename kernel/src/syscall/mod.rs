@@ -1,3 +1,8 @@
+//! System call interface — SYSCALL/SYSRET dispatch to POSIX handlers.
+//!
+//! `table.rs` maps Linux x86_64 syscall numbers to `handlers/*` functions.
+//! `uaccess.rs` validates and copies user pointers.
+
 pub mod errno;
 pub mod handlers;
 pub mod nr;

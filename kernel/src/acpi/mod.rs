@@ -1,3 +1,7 @@
+//! ACPI table parser — RSDP discovery, MADT, FADT, DSDT, SRAT.
+//!
+//! Used for SMP CPU enumeration, LAPIC/IOAPIC addresses, and NUMA topology.
+
 pub mod tables;
 pub mod madt;
 pub mod fadt;

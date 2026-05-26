@@ -1,3 +1,8 @@
+//! Limine boot protocol — parse bootloader responses into `BootInfo`.
+//!
+//! `limine.rs` holds the Limine request/response structs; `info.rs` normalizes
+//! them into a stable kernel-facing boot description.
+
 pub mod limine;
 pub mod info;
 

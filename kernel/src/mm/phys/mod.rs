@@ -1,3 +1,5 @@
+//! Physical page allocator — bitmap (order 0) + buddy (orders 1–10).
+
 pub mod bitmap;
 pub mod buddy;
 pub mod frame;

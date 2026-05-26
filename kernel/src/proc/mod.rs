@@ -1,3 +1,8 @@
+//! Process and thread management — PCB, TCB, fork/exec/exit, capability checks.
+//!
+//! `table.rs` holds static process/thread tables; `exec.rs` loads ELF binaries;
+//! `current_tid()` tracks the running thread per CPU.
+
 pub mod exec;
 pub mod id;
 pub mod pcb;

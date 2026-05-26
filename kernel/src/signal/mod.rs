@@ -1,3 +1,7 @@
+//! POSIX signal delivery — pending queue, handler frames, sigreturn.
+//!
+//! Signals are checked after each syscall; `delivery.rs` builds user trampolines.
+
 pub mod delivery;
 pub mod types;
 

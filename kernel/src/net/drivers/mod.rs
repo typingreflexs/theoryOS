@@ -1,3 +1,7 @@
+//! Network interface drivers — PCI probe for virtio-net and Intel e1000.
+//!
+//! `pci::map_bar0` maps MMIO before touching device registers.
+
 pub mod e1000;
 pub mod virtio;
 

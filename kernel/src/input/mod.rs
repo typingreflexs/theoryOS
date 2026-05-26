@@ -1,4 +1,6 @@
-//! Input devices (polled at boot — no IRQ backend yet).
+//! PS/2 keyboard and mouse — polled from the idle loop (no IRQ backend yet).
+//!
+//! Scancodes are translated to ASCII in `ps2.rs`; mouse packets in `mouse.rs`.
 
 pub mod mouse;
 pub mod ps2;

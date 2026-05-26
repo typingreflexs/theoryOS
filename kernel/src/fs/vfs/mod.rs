@@ -1,3 +1,5 @@
+//! Virtual filesystem core — inodes, dentries, mounts, path walk, file ops.
+
 pub mod dentry;
 pub mod file;
 pub mod inode;

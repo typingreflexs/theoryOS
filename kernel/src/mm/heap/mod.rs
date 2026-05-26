@@ -1,3 +1,5 @@
+//! Kernel heap — slab allocator implementing `GlobalAlloc`.
+
 pub mod slab;
 
 use core::alloc::{GlobalAlloc, Layout};

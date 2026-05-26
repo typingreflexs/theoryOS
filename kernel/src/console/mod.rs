@@ -1,3 +1,7 @@
+//! Serial console — early debug output over COM1 (0x3F8).
+//!
+//! All `Console::println` messages appear in QEMU serial log and `-serial stdio`.
+
 pub mod serial;
 
 use core::fmt::{self, Write};

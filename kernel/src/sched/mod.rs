@@ -1,3 +1,8 @@
+//! Scheduler — CFS, per-CPU run queues, context switch, preemption.
+//!
+//! `idle.rs` runs the UI/input/network poll loop on the BSP.
+//! `timer.rs` drives APIC timer ticks for vruntime accounting.
+
 pub mod cfs;
 pub mod idle;
 pub mod rbtree;

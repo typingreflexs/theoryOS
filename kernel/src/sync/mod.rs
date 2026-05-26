@@ -1,3 +1,7 @@
+//! Synchronization primitives — spin locks wrapping `spin::Mutex`.
+//!
+//! Used throughout the kernel where short critical sections are needed.
+
 use spin::Mutex;
 
 pub mod mutex;

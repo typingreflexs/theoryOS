@@ -1,3 +1,5 @@
+//! Page tables — 4-level PML4 on x86_64 with recursive self-map.
+
 pub mod x86_64;
 
 pub use x86_64::{PageFlags, PageTable, PhysFrame};

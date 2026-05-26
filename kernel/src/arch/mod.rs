@@ -1,3 +1,8 @@
+//! Architecture port layer — dispatches to x86_64 or aarch64 backend.
+//!
+//! All CPU-specific code lives under `x86_64/` or `aarch64/`. The `Arch` trait
+//! in `traits.rs` defines the interface for future multi-arch support.
+
 pub mod traits;
 pub mod memory;
 

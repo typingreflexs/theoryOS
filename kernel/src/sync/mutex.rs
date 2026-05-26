@@ -1,3 +1,5 @@
+//! Priority-inheritance mutex — blocks thread and boosts owner priority on contention.
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 

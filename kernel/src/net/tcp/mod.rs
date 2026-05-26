@@ -1,4 +1,4 @@
-//! TCP — sliding window, retransmission, state machine.
+//! TCP — sliding window, retransmission, CUBIC congestion control.
 
 pub mod cubic;
 

@@ -1,4 +1,9 @@
-//! Theory OS network stack.
+//! Theory OS network stack — Ethernet through HTTP.
+//!
+//! NIC drivers are probed lazily (`drivers::probe`). The idle loop calls
+//! `rx_poll()` and `dhcp::tick()` once a device is registered.
+//!
+//! Layers: PCI → e1000/virtio → eth → ARP → IPv4 → UDP/TCP → DHCP/DNS/HTTP.
 
 pub mod addr;
 pub mod arp;

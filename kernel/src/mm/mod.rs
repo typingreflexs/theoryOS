@@ -1,3 +1,8 @@
+//! Memory management — physical frames, paging, heap, VMAs, COW, ELF loading.
+//!
+//! Initialization order: phys → paging → numa → aslr → address spaces →
+//! IDT (page faults) → slab heap → vm manager.
+
 pub mod address_space;
 pub mod aslr;
 pub mod cow;

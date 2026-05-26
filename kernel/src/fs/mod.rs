@@ -1,4 +1,7 @@
 //! Virtual filesystem layer — VFS, block devices, and filesystem drivers.
+//!
+//! Mount order at boot: `/` tmpfs → `/proc` → `/dev` → `/tmp` → `/sys`
+//! → optional `/mnt/ext2` and `/mnt/fat32` on ramdisks.
 
 pub mod block;
 pub mod devfs;

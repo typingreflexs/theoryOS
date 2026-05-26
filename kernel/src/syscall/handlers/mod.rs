@@ -1,3 +1,5 @@
+//! Syscall handler groups — one module per subsystem (fs, proc, mm, ipc, etc.).
+
 pub mod fs;
 pub mod ipc;
 pub mod io;
