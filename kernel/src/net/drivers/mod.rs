@@ -3,6 +3,7 @@
 //! `pci::map_bar0` maps MMIO before touching device registers.
 
 pub mod e1000;
+pub mod rtl8169;
 pub mod virtio;
 
 use crate::console::Console;
@@ -26,6 +27,14 @@ pub fn probe() -> bool {
         if let Some(dev) = e1000::init(pci_dev) {
             device::set_device(dev);
             Console::println("[net] e1000 initialized");
+            return true;
+        }
+    }
+    if let Some(pci_dev) = rtl8169::find_card() {
+        pci::enable_device(&pci_dev);
+        if let Some(dev) = rtl8169::init(pci_dev) {
+            device::set_device(dev);
+            Console::println("[net] rtl8169 initialized");
             return true;
         }
     }

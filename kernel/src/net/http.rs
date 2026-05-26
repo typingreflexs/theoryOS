@@ -1,5 +1,11 @@
 //! Minimal HTTP/1.0 client (plain HTTP only).
+//!
+//! Resolution → connect → request → receive is driven incrementally by
+//! `fetch_step`, which is called from the browser's idle tick. Real
+//! wall-clock timeouts ensure the kernel never spins indefinitely if a
+//! remote server is slow or unreachable.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -10,40 +16,105 @@ use super::dhcp;
 use super::dns;
 use super::tcp::{self, TcpState};
 
-const HTTP_PORT: u16 = 80;
+const DEFAULT_HTTP_PORT: u16 = 80;
+const HTTP_STEP_BUDGET: u32 = 200;
+const CONNECT_TIMEOUT_NS: u64 = 12_000_000_000;
+const RECEIVE_IDLE_TIMEOUT_NS: u64 = 8_000_000_000;
+const TOTAL_TIMEOUT_NS: u64 = 30_000_000_000;
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const INITIAL_BUF: usize = 8 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchPhase {
+    ResolvingDns,
+    Connecting,
+    Sending,
+    Receiving,
+}
+
+impl FetchPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            FetchPhase::ResolvingDns => "Resolving",
+            FetchPhase::Connecting => "Connecting",
+            FetchPhase::Sending => "Sending request",
+            FetchPhase::Receiving => "Receiving",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FetchProgress {
+    pub phase: FetchPhase,
+    pub host: String,
+    pub remote_ip: Option<Ipv4Addr>,
+    pub bytes_received: usize,
+    pub status_code: Option<u16>,
+}
 
 pub enum FetchStep {
     Pending,
-    Done(Vec<String>),
+    Done(FetchResult),
     Error(&'static str),
 }
 
+#[derive(Clone, Debug)]
+pub struct FetchResult {
+    pub status_code: u16,
+    pub host: String,
+    pub remote_ip: Option<Ipv4Addr>,
+    pub bytes_received: usize,
+    pub lines: Vec<RenderedLine>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LineStyle {
+    Body,
+    Heading,
+    Link,
+    Code,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderedLine {
+    pub text: String,
+    pub style: LineStyle,
+}
+
 struct FetchState {
-    url: String,
     host: String,
     path: String,
+    port: u16,
     remote_ip: Option<Ipv4Addr>,
     conn: Option<u32>,
-    phase: u8,
+    phase: FetchPhase,
     dns_iters: u32,
-    tcp_iters: u32,
-    recv_iters: u32,
     raw: Vec<u8>,
     recv_len: usize,
+    started_ns: u64,
+    last_progress_ns: u64,
+    sent: bool,
 }
 
 static FETCH: Mutex<Option<FetchState>> = Mutex::new(None);
+static PROGRESS: Mutex<Option<FetchProgress>> = Mutex::new(None);
 
 pub fn is_online() -> bool {
     device::has_device() && dhcp::leased_ip().is_some()
 }
 
+pub fn current_progress() -> Option<FetchProgress> {
+    PROGRESS.lock().clone()
+}
+
 pub fn fetch_cancel() {
     *FETCH.lock() = None;
+    *PROGRESS.lock() = None;
     dns::reset_query();
 }
 
-/// One incremental step per idle tick — avoids stack overflow and UI freezes.
+/// Drive one incremental step. Returns `Done` when the page is rendered,
+/// `Pending` to continue next idle tick, or `Error` if the fetch fails.
 pub fn fetch_step(url: &str) -> FetchStep {
     let mut slot = FETCH.lock();
     if slot.is_none() {
@@ -53,151 +124,252 @@ pub fn fetch_step(url: &str) -> FetchStep {
         }
     }
 
+    let now = crate::sched::timer::monotonic_ns();
     let st = slot.as_mut().unwrap();
+
+    if now.saturating_sub(st.started_ns) > TOTAL_TIMEOUT_NS {
+        let host = st.host.clone();
+        drop(slot);
+        finish_with_error(&host);
+        return FetchStep::Error("Request timed out");
+    }
+
     for _ in 0..HTTP_STEP_BUDGET {
         match st.phase {
-            0 => {
+            FetchPhase::ResolvingDns => {
                 if let Ok(octets) = parse_ipv4(&st.host) {
                     st.remote_ip = Some(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
-                    st.phase = 2;
-                } else {
-                    st.phase = 1;
+                    st.phase = FetchPhase::Connecting;
+                    st.last_progress_ns = now;
+                    continue;
                 }
-            }
-            1 => {
                 st.dns_iters += 1;
                 if let Some(ip) = dns::resolve_step(&st.host) {
                     st.remote_ip = Some(ip);
-                    st.phase = 2;
-                } else if st.dns_iters > 15_000 {
+                    st.phase = FetchPhase::Connecting;
+                    st.last_progress_ns = now;
+                } else if st.dns_iters > 30_000
+                    || now.saturating_sub(st.last_progress_ns) > CONNECT_TIMEOUT_NS
+                {
                     *slot = None;
+                    let mut p = PROGRESS.lock();
+                    *p = None;
                     return FetchStep::Error("DNS lookup failed");
                 }
             }
-            2 => {
+            FetchPhase::Connecting => {
                 let ip = st.remote_ip.unwrap();
                 if st.conn.is_none() {
-                    st.conn = tcp::connect(super::addr::IpAddr::V4(ip), HTTP_PORT, 49152);
+                    st.conn = tcp::connect(super::addr::IpAddr::V4(ip), st.port, ephemeral_port());
                     if st.conn.is_none() {
                         *slot = None;
-                        return FetchStep::Error("TCP slot full");
+                        return FetchStep::Error("No free TCP slots");
                     }
                 }
-                st.tcp_iters += 1;
                 super::rx_poll();
                 if tcp::with_connection(st.conn.unwrap(), |c| c.state == TcpState::Established)
                     .unwrap_or(false)
                 {
-                    let request = alloc::format!(
-                        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                        st.path, st.host
-                    );
-                    if tcp::send(st.conn.unwrap(), request.as_bytes()).is_err() {
-                        *slot = None;
-                        return FetchStep::Error("TCP send failed");
-                    }
-                    st.phase = 3;
-                } else if st.tcp_iters > 30_000 {
+                    st.phase = FetchPhase::Sending;
+                    st.last_progress_ns = now;
+                } else if now.saturating_sub(st.last_progress_ns) > CONNECT_TIMEOUT_NS {
                     *slot = None;
                     return FetchStep::Error("TCP connect timeout");
                 }
             }
-            3 => {
-                st.recv_iters += 1;
+            FetchPhase::Sending => {
+                let request = format!(
+                    "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: TheoryOS/0.1\r\nAccept: text/html, text/plain\r\nConnection: close\r\n\r\n",
+                    st.path, st.host
+                );
+                if tcp::send(st.conn.unwrap(), request.as_bytes()).is_err() {
+                    *slot = None;
+                    return FetchStep::Error("TCP send failed");
+                }
+                st.sent = true;
+                st.phase = FetchPhase::Receiving;
+                st.last_progress_ns = now;
+            }
+            FetchPhase::Receiving => {
                 super::rx_poll();
                 tcp::tick();
-                if let Some(n) = tcp::recv(st.conn.unwrap(), &mut st.raw[st.recv_len..]) {
-                    st.recv_len += n;
-                    if st.recv_len >= st.raw.len() {
+                if st.recv_len == st.raw.len() {
+                    if st.raw.len() < MAX_BODY_BYTES {
+                        let new_len = (st.raw.len() * 2).min(MAX_BODY_BYTES);
+                        st.raw.resize(new_len, 0);
+                    } else {
                         break;
                     }
+                }
+                if let Some(n) = tcp::recv(st.conn.unwrap(), &mut st.raw[st.recv_len..]) {
+                    st.recv_len += n;
+                    st.last_progress_ns = now;
                 } else if tcp::with_connection(st.conn.unwrap(), |c| c.state == TcpState::Closed)
                     .unwrap_or(false)
-                    || (st.recv_len > 0 && st.recv_iters > 4_000)
                 {
                     break;
-                } else if st.recv_iters > 100_000 {
+                } else if now.saturating_sub(st.last_progress_ns) > RECEIVE_IDLE_TIMEOUT_NS {
+                    if st.recv_len > 0 {
+                        break;
+                    }
                     *slot = None;
-                    return FetchStep::Error("empty response");
+                    return FetchStep::Error("No response from server");
                 }
             }
-            _ => break,
         }
     }
 
-    if st.phase < 3 || (st.phase == 3 && st.recv_len == 0 && st.recv_iters <= 100_000) {
+    // Publish progress for the UI.
+    {
+        let mut p = PROGRESS.lock();
+        *p = Some(FetchProgress {
+            phase: st.phase,
+            host: st.host.clone(),
+            remote_ip: st.remote_ip,
+            bytes_received: st.recv_len,
+            status_code: None,
+        });
+    }
+
+    let buffer_full = st.recv_len >= MAX_BODY_BYTES;
+    let conn_closed = st
+        .conn
+        .and_then(|c| tcp::with_connection(c, |t| t.state == TcpState::Closed))
+        .unwrap_or(false);
+    let receive_idle =
+        st.recv_len > 0 && now.saturating_sub(st.last_progress_ns) > RECEIVE_IDLE_TIMEOUT_NS;
+    let receiving_done =
+        st.phase == FetchPhase::Receiving && (buffer_full || conn_closed || receive_idle);
+
+    if !receiving_done {
         return FetchStep::Pending;
     }
 
-    if st.phase == 3 && st.recv_len == 0 {
-        *slot = None;
-        return FetchStep::Error("empty response");
-    }
-
+    let status = parse_status(&st.raw[..st.recv_len]);
     let body = extract_body(&st.raw[..st.recv_len]);
-    let text = strip_tags(body);
-    let lines = wrap_lines(&text, 72);
+    let lines = render_html(body, 88);
+    let result = FetchResult {
+        status_code: status.unwrap_or(0),
+        host: st.host.clone(),
+        remote_ip: st.remote_ip,
+        bytes_received: st.recv_len,
+        lines,
+    };
     *slot = None;
-    FetchStep::Done(lines)
+    *PROGRESS.lock() = None;
+    FetchStep::Done(result)
 }
 
-const HTTP_STEP_BUDGET: u32 = 200;
+fn finish_with_error(host: &str) {
+    *FETCH.lock() = None;
+    *PROGRESS.lock() = Some(FetchProgress {
+        phase: FetchPhase::Receiving,
+        host: String::from(host),
+        remote_ip: None,
+        bytes_received: 0,
+        status_code: None,
+    });
+}
 
 fn begin_fetch(url: &str) -> Result<FetchState, &'static str> {
     if !device::has_device() {
-        return Err("no network adapter");
+        return Err("No network adapter");
     }
     if dhcp::leased_ip().is_none() {
-        return Err("waiting for DHCP");
+        return Err("No IP address — connect to Network first");
     }
 
     let url = url.trim();
-    let rest = url.strip_prefix("http://").ok_or("use http:// only (no TLS yet)")?;
-    let (host, path) = match rest.find('/') {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("Only http:// URLs supported (no TLS)")?;
+    let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    if host.is_empty() {
-        return Err("missing host");
+    if hostport.is_empty() {
+        return Err("Missing host");
     }
+    let (host, port) = parse_host_port(hostport)?;
 
+    let now = crate::sched::timer::monotonic_ns();
     Ok(FetchState {
-        url: String::from(url),
         host: String::from(host),
         path: String::from(path),
+        port,
         remote_ip: None,
         conn: None,
-        phase: 0,
+        phase: FetchPhase::ResolvingDns,
         dns_iters: 0,
-        tcp_iters: 0,
-        recv_iters: 0,
-        raw: alloc::vec![0u8; 8192],
+        raw: alloc::vec![0u8; INITIAL_BUF],
         recv_len: 0,
+        started_ns: now,
+        last_progress_ns: now,
+        sent: false,
     })
 }
 
-pub fn fetch(url: &str) -> Result<String, &'static str> {
+fn parse_host_port(s: &str) -> Result<(&str, u16), &'static str> {
+    if let Some(idx) = s.find(':') {
+        let host = &s[..idx];
+        let port_str = &s[idx + 1..];
+        let mut p: u32 = 0;
+        if port_str.is_empty() {
+            return Err("Invalid port");
+        }
+        for b in port_str.bytes() {
+            if !b.is_ascii_digit() {
+                return Err("Invalid port");
+            }
+            p = p * 10 + (b - b'0') as u32;
+            if p > 65535 {
+                return Err("Invalid port");
+            }
+        }
+        Ok((host, p as u16))
+    } else {
+        Ok((s, DEFAULT_HTTP_PORT))
+    }
+}
+
+fn ephemeral_port() -> u16 {
+    let tsc = crate::arch::x86_64::cpu::rdtsc();
+    49152 + ((tsc as u16) & 0x3FFF)
+}
+
+/// Blocking convenience wrapper used by the shell.
+pub fn fetch_blocking(url: &str) -> Result<FetchResult, &'static str> {
     fetch_cancel();
     loop {
         match fetch_step(url) {
-            FetchStep::Done(lines) => {
-                return Ok(lines.join("\n"));
-            }
+            FetchStep::Done(r) => return Ok(r),
             FetchStep::Error(e) => return Err(e),
-            FetchStep::Pending => {}
+            FetchStep::Pending => {
+                super::rx_poll();
+                for _ in 0..200 {
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 }
 
 pub fn fetch_lines(url: &str) -> Vec<String> {
-    fetch_cancel();
-    loop {
-        match fetch_step(url) {
-            FetchStep::Done(lines) => return lines,
-            FetchStep::Error(e) => return alloc::vec![String::from(e)],
-            FetchStep::Pending => {}
-        }
+    match fetch_blocking(url) {
+        Ok(r) => r.lines.into_iter().map(|l| l.text).collect(),
+        Err(e) => alloc::vec![String::from(e)],
     }
+}
+
+pub fn fetch(url: &str) -> Result<String, &'static str> {
+    fetch_blocking(url).map(|r| {
+        let mut out = String::new();
+        for l in r.lines {
+            out.push_str(&l.text);
+            out.push('\n');
+        }
+        out
+    })
 }
 
 fn parse_ipv4(s: &str) -> Result<[u8; 4], ()> {
@@ -233,6 +405,15 @@ fn parse_u8(s: &str) -> Option<u8> {
     Some(n as u8)
 }
 
+fn parse_status(data: &[u8]) -> Option<u16> {
+    let text = core::str::from_utf8(data).ok()?;
+    let line = text.split('\n').next()?;
+    let mut parts = line.split_whitespace();
+    let _http = parts.next()?;
+    let code = parts.next()?;
+    code.parse::<u16>().ok()
+}
+
 fn extract_body(data: &[u8]) -> &str {
     let text = core::str::from_utf8(data).unwrap_or("");
     if let Some(pos) = text.find("\r\n\r\n") {
@@ -244,36 +425,291 @@ fn extract_body(data: &[u8]) -> &str {
     }
 }
 
-fn strip_tags(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    let mut last_space = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => {
-                if ch.is_whitespace() {
-                    if !last_space && !out.is_empty() {
-                        out.push(' ');
-                        last_space = true;
-                    }
-                } else {
-                    out.push(ch);
-                    last_space = false;
-                }
+/// Render HTML to a list of styled lines. Strips `<script>` and `<style>`
+/// content, decodes common entities, preserves block breaks at headings/
+/// paragraphs/list items, and keeps link text inline as `[text]`.
+fn render_html(html: &str, wrap: usize) -> Vec<RenderedLine> {
+    let stripped = strip_script_and_style(html);
+    let mut tokens: Vec<HtmlToken> = Vec::new();
+    let mut iter = stripped.char_indices().peekable();
+    let bytes = stripped.as_bytes();
+    let mut last_pos = 0usize;
+
+    while let Some(&(i, ch)) = iter.peek() {
+        if ch == '<' {
+            if last_pos < i {
+                push_text_token(&mut tokens, &stripped[last_pos..i]);
             }
-            _ => {}
+            iter.next();
+            let mut tag = String::new();
+            while let Some(&(_, c)) = iter.peek() {
+                iter.next();
+                if c == '>' {
+                    break;
+                }
+                tag.push(c);
+            }
+            if let Some(t) = classify_tag(&tag) {
+                tokens.push(HtmlToken::Tag(t));
+            }
+            last_pos = iter.peek().map(|&(p, _)| p).unwrap_or(bytes.len());
+        } else {
+            iter.next();
         }
     }
-    if out.len() > 4000 {
-        out.truncate(4000);
-        out.push_str("...");
+    if last_pos < stripped.len() {
+        push_text_token(&mut tokens, &stripped[last_pos..]);
+    }
+
+    let mut blocks: Vec<(LineStyle, String)> = Vec::new();
+    let mut current_text = String::new();
+    let mut current_style = LineStyle::Body;
+    let mut last_space = true;
+
+    for tok in tokens {
+        match tok {
+            HtmlToken::Text(s) => {
+                let decoded = decode_entities(&s);
+                for ch in decoded.chars() {
+                    if ch.is_whitespace() {
+                        if !last_space {
+                            current_text.push(' ');
+                            last_space = true;
+                        }
+                    } else {
+                        current_text.push(ch);
+                        last_space = false;
+                    }
+                }
+            }
+            HtmlToken::Tag(tag) => match tag {
+                TagKind::ParagraphBreak | TagKind::Heading => {
+                    if !current_text.trim().is_empty() {
+                        blocks.push((current_style.clone(), current_text.trim().into()));
+                    }
+                    current_text = String::new();
+                    last_space = true;
+                    current_style = if matches!(tag, TagKind::Heading) {
+                        LineStyle::Heading
+                    } else {
+                        LineStyle::Body
+                    };
+                }
+                TagKind::EndHeading => {
+                    if !current_text.trim().is_empty() {
+                        blocks.push((LineStyle::Heading, current_text.trim().into()));
+                    }
+                    current_text = String::new();
+                    last_space = true;
+                    current_style = LineStyle::Body;
+                }
+                TagKind::LinkOpen => {
+                    if !last_space {
+                        current_text.push(' ');
+                    }
+                    current_text.push('[');
+                    last_space = false;
+                }
+                TagKind::LinkClose => {
+                    current_text.push(']');
+                    last_space = false;
+                }
+                TagKind::ListItem => {
+                    if !current_text.trim().is_empty() {
+                        blocks.push((current_style.clone(), current_text.trim().into()));
+                    }
+                    current_text = String::from("• ");
+                    last_space = false;
+                }
+                TagKind::CodeOpen => {
+                    current_style = LineStyle::Code;
+                }
+                TagKind::CodeClose => {
+                    if !current_text.trim().is_empty() {
+                        blocks.push((LineStyle::Code, current_text.trim().into()));
+                    }
+                    current_text = String::new();
+                    current_style = LineStyle::Body;
+                    last_space = true;
+                }
+                TagKind::LineBreak => {
+                    if !current_text.trim().is_empty() {
+                        blocks.push((current_style.clone(), current_text.trim().into()));
+                    }
+                    current_text = String::new();
+                    last_space = true;
+                }
+            },
+        }
+    }
+    if !current_text.trim().is_empty() {
+        blocks.push((current_style, current_text.trim().into()));
+    }
+
+    // Word-wrap each block to the target width.
+    let mut out = Vec::new();
+    for (style, text) in blocks {
+        for wrapped in wrap_text(&text, wrap) {
+            out.push(RenderedLine {
+                text: wrapped,
+                style: style.clone(),
+            });
+        }
+        // Blank line between blocks for readability.
+        if matches!(style, LineStyle::Heading) {
+            out.push(RenderedLine {
+                text: String::new(),
+                style: LineStyle::Body,
+            });
+        }
+    }
+    if out.is_empty() {
+        out.push(RenderedLine {
+            text: String::from("(empty page)"),
+            style: LineStyle::Body,
+        });
     }
     out
 }
 
-fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+fn push_text_token(out: &mut Vec<HtmlToken>, s: &str) {
+    if !s.is_empty() {
+        out.push(HtmlToken::Text(String::from(s)));
+    }
+}
+
+enum HtmlToken {
+    Text(String),
+    Tag(TagKind),
+}
+
+enum TagKind {
+    ParagraphBreak,
+    Heading,
+    EndHeading,
+    LinkOpen,
+    LinkClose,
+    ListItem,
+    CodeOpen,
+    CodeClose,
+    LineBreak,
+}
+
+fn classify_tag(tag: &str) -> Option<TagKind> {
+    let trimmed = tag.trim();
+    let name = trimmed
+        .split(|c: char| c.is_whitespace() || c == '>')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "p" | "div" | "br/" | "hr" | "tr" | "table" | "section" | "article" => {
+            Some(TagKind::ParagraphBreak)
+        }
+        "br" => Some(TagKind::LineBreak),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some(TagKind::Heading),
+        "/h1" | "/h2" | "/h3" | "/h4" | "/h5" | "/h6" => Some(TagKind::EndHeading),
+        "a" => Some(TagKind::LinkOpen),
+        "/a" => Some(TagKind::LinkClose),
+        "li" => Some(TagKind::ListItem),
+        "code" | "pre" => Some(TagKind::CodeOpen),
+        "/code" | "/pre" => Some(TagKind::CodeClose),
+        "/p" | "/div" | "/tr" | "/section" | "/article" => Some(TagKind::ParagraphBreak),
+        _ => None,
+    }
+}
+
+fn strip_script_and_style(html: &str) -> String {
+    let lower: String = html.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let mut out = String::with_capacity(html.len());
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest_lower = &lower[i..];
+        if rest_lower.starts_with("<script") {
+            if let Some(end) = lower[i..].find("</script>") {
+                i += end + "</script>".len();
+                continue;
+            } else {
+                break;
+            }
+        }
+        if rest_lower.starts_with("<style") {
+            if let Some(end) = lower[i..].find("</style>") {
+                i += end + "</style>".len();
+                continue;
+            } else {
+                break;
+            }
+        }
+        if rest_lower.starts_with("<!--") {
+            if let Some(end) = lower[i..].find("-->") {
+                i += end + "-->".len();
+                continue;
+            } else {
+                break;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        let mut entity = String::new();
+        let mut closed = false;
+        for _ in 0..8 {
+            match iter.next() {
+                Some(';') => {
+                    closed = true;
+                    break;
+                }
+                Some(ec) => entity.push(ec),
+                None => break,
+            }
+        }
+        if !closed {
+            out.push('&');
+            out.push_str(&entity);
+            continue;
+        }
+        let decoded = match entity.as_str() {
+            "amp" => "&",
+            "lt" => "<",
+            "gt" => ">",
+            "quot" => "\"",
+            "apos" => "'",
+            "nbsp" => " ",
+            "mdash" => "—",
+            "ndash" => "–",
+            "hellip" => "…",
+            _ => "",
+        };
+        if !decoded.is_empty() {
+            out.push_str(decoded);
+        } else if let Some(rest) = entity.strip_prefix('#') {
+            let n = if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                rest.parse::<u32>().ok()
+            };
+            if let Some(code) = n.and_then(char::from_u32) {
+                out.push(code);
+            }
+        }
+    }
+    out
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
@@ -291,7 +727,7 @@ fn wrap_lines(text: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     if lines.is_empty() {
-        lines.push(String::from("(empty page)"));
+        lines.push(String::new());
     }
     lines
 }

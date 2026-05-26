@@ -12,6 +12,15 @@ pub fn set_server(ip: Ipv4Addr) {
     *DNS_SERVER.lock() = ip;
 }
 
+pub fn current_server() -> Option<Ipv4Addr> {
+    let s = *DNS_SERVER.lock();
+    if s.0 == [0, 0, 0, 0] {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 static DNS_QUERY: spin::Mutex<Option<(u16, alloc::vec::Vec<u8>)>> = spin::Mutex::new(None);
 
 pub fn reset_query() {

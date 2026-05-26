@@ -1,3 +1,5 @@
+pub mod ahci;
+pub mod nvme;
 pub mod ramdisk;
 
 use spin::Mutex;

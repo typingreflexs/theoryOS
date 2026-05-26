@@ -1,10 +1,20 @@
+//! Desktop application launcher, window manager, and embedded apps.
+//!
+//! The desktop hosts five apps: Console, Settings, Browser, Files, and Network.
+//! Each app draws into a centered window; the launcher overlays the work area
+//! when the Start menu is open. Mouse clicks are routed through
+//! `handle_click` to either a button hit-test or the focused app.
+
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::draw::{self, rgb, text_width};
 use super::desktop::{self, TASKBAR_H};
 use super::framebuffer::Framebuffer;
 use crate::input::mouse;
-use crate::net::{self, dhcp, wifi};
+use crate::net::{self, wifi};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppId {
@@ -35,10 +45,31 @@ impl DesktopApps {
 
 static APPS: Mutex<DesktopApps> = Mutex::new(DesktopApps::new());
 
+/// Clickable regions registered each frame; the next click queries this list.
+#[derive(Clone, Copy)]
+struct Hotspot {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    action: NetAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetAction {
+    Connect,
+    Disconnect,
+    Rescan,
+    OpenBrowser,
+}
+
+static NET_HOTSPOTS: Mutex<Vec<Hotspot>> = Mutex::new(Vec::new());
+
 pub fn init() {
     wifi::init();
 }
 
+/// Bring up the NIC and start DHCP. Idempotent across opens.
 pub fn init_network_once() {
     let mut apps = APPS.lock();
     if apps.net_ready {
@@ -92,7 +123,6 @@ pub fn handle_click(x: i32, y: i32, fb: &Framebuffer) -> bool {
     let uy = y as u32;
     let ty = desktop::taskbar_y(fb);
 
-    // Start button
     if uy >= ty + 6 && uy <= ty + TASKBAR_H - 6 && ux >= 8 && ux <= 128 {
         toggle_launcher();
         return true;
@@ -112,9 +142,36 @@ pub fn handle_click(x: i32, y: i32, fb: &Framebuffer) -> bool {
         }
     }
 
-    if apps.focus == AppId::Console {
-        drop(apps);
-        return false;
+    let focus = apps.focus;
+    drop(apps);
+
+    match focus {
+        AppId::Wifi => handle_network_click(ux, uy),
+        AppId::Browser => {
+            if super::browser::handle_click(ux, uy) {
+                mark_dirty();
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn handle_network_click(x: u32, y: u32) -> bool {
+    let hotspots: Vec<Hotspot> = NET_HOTSPOTS.lock().clone();
+    for h in hotspots {
+        if x >= h.x && x < h.x + h.w && y >= h.y && y < h.y + h.h {
+            match h.action {
+                NetAction::Connect => wifi::connect(),
+                NetAction::Disconnect => wifi::disconnect(),
+                NetAction::Rescan => wifi::rescan(),
+                NetAction::OpenBrowser => open(AppId::Browser),
+            }
+            mark_dirty();
+            return true;
+        }
     }
     false
 }
@@ -147,25 +204,28 @@ fn launcher_hit(x: u32, y: u32, fb: &Framebuffer) -> Option<AppId> {
 }
 
 pub fn draw(fb: &Framebuffer) {
+    NET_HOTSPOTS.lock().clear();
     let apps = APPS.lock();
-    match apps.focus {
+    let focus = apps.focus;
+    let launcher_open = apps.launcher_open;
+    drop(apps);
+    match focus {
         AppId::Console => {}
         AppId::Settings => draw_settings(fb),
         AppId::Browser => draw_browser(fb),
         AppId::Files => draw_files(fb),
-        AppId::Wifi => draw_wifi(fb),
+        AppId::Wifi => draw_network(fb),
     }
-    if apps.launcher_open {
+    if launcher_open {
         draw_launcher(fb);
     }
-    drop(apps);
     draw_cursor(fb);
 }
 
 fn window_frame(fb: &Framebuffer, title: &str) -> (u32, u32, u32, u32) {
     let wh = desktop::work_height(fb);
-    let w = fb.width.saturating_sub(80).min(640).max(400);
-    let h = wh.saturating_sub(80).min(420).max(240);
+    let w = fb.width.saturating_sub(80).min(720).max(420);
+    let h = wh.saturating_sub(80).min(480).max(280);
     let x = (fb.width - w) / 2;
     let y = (wh - h) / 3;
     draw::fill_rect(fb, x, y, w, h, rgb(20, 20, 28));
@@ -189,29 +249,15 @@ fn draw_settings(fb: &Framebuffer) {
         fb,
         x + 24,
         line,
-        &alloc::format!("Display: {}x{}", fb.width, fb.height),
+        &format!("Display: {}x{}", fb.width, fb.height),
         rgb(210, 210, 220),
     );
     line += lh + 8;
     draw_line(fb, x + 16, line, "Network", rgb(120, 180, 255));
     line += lh;
-    if let Some(ip) = dhcp::leased_ip() {
-        draw_line(
-            fb,
-            x + 24,
-            line,
-            &alloc::format!(
-                "Ethernet: {}.{}.{}.{} (DHCP)",
-                ip.0[0],
-                ip.0[1],
-                ip.0[2],
-                ip.0[3]
-            ),
-            rgb(210, 210, 220),
-        );
-    } else {
-        draw_line(fb, x + 24, line, &wifi::ethernet_line(), rgb(160, 160, 176));
-    }
+    draw_line(fb, x + 24, line, &wifi::ethernet_line(), rgb(210, 210, 220));
+    line += lh;
+    draw_line(fb, x + 24, line, &wifi::dns_status(), rgb(160, 160, 176));
     line += lh;
     draw_line(fb, x + 24, line, wifi::wifi_line(), rgb(160, 160, 176));
     line += lh + 8;
@@ -245,18 +291,135 @@ fn draw_files(fb: &Framebuffer) {
     }
 }
 
-fn draw_wifi(fb: &Framebuffer) {
+fn draw_network(fb: &Framebuffer) {
     let (x, y, w, h) = window_frame(fb, "Network");
     let body_y = y + 44;
     draw::fill_rect(fb, x + 8, body_y, w - 16, h - 52, rgb(12, 12, 16));
-    let mut line = body_y + 8;
-    draw_line(fb, x + 16, line, &wifi::status_line(), rgb(120, 220, 120));
-    line += 24;
-    draw_line(fb, x + 16, line, &wifi::ethernet_line(), rgb(210, 210, 220));
-    line += 24;
-    draw_line(fb, x + 16, line, wifi::wifi_line(), rgb(160, 160, 176));
-    line += 24;
-    draw_line(fb, x + 16, line, "Open Browser to load web pages.", rgb(140, 140, 160));
+
+    let mut line = body_y + 12;
+    let connect_color = match wifi::state() {
+        wifi::ConnState::Connected => rgb(120, 220, 120),
+        wifi::ConnState::Acquiring => rgb(220, 200, 120),
+        wifi::ConnState::Failed => rgb(220, 120, 120),
+        _ => rgb(180, 180, 200),
+    };
+    draw_line(fb, x + 16, line, &wifi::status_line(), connect_color);
+    line += 22;
+
+    if let Some(err) = wifi::last_error() {
+        draw_line(fb, x + 16, line, err, rgb(220, 140, 140));
+        line += 20;
+    }
+
+    // Action buttons
+    let btn_y = line + 4;
+    let connected = matches!(wifi::state(), wifi::ConnState::Connected);
+    let acquiring = matches!(wifi::state(), wifi::ConnState::Acquiring);
+    let primary = if connected {
+        ("Disconnect", NetAction::Disconnect, rgb(160, 60, 60))
+    } else if acquiring {
+        ("Cancel", NetAction::Disconnect, rgb(160, 100, 60))
+    } else {
+        ("Connect", NetAction::Connect, rgb(60, 120, 220))
+    };
+    draw_button(fb, x + 16, btn_y, 120, 30, primary.0, primary.2, primary.1);
+    draw_button(fb, x + 148, btn_y, 100, 30, "Rescan", rgb(60, 80, 110), NetAction::Rescan);
+    if connected {
+        draw_button(fb, x + 260, btn_y, 130, 30, "Open Browser", rgb(60, 120, 90), NetAction::OpenBrowser);
+    }
+    line = btn_y + 40;
+
+    // Link list
+    draw_line(fb, x + 16, line, "Available links", rgb(120, 180, 255));
+    line += 20;
+
+    let links = wifi::links();
+    if links.is_empty() {
+        draw_line(fb, x + 24, line, "(no network adapters detected)", rgb(160, 160, 176));
+    } else {
+        for link in &links {
+            let label_color = if link.state == wifi::ConnState::Connected {
+                rgb(160, 230, 160)
+            } else {
+                rgb(220, 220, 230)
+            };
+            draw_line(fb, x + 24, line, &link.label, label_color);
+            draw_line(
+                fb,
+                x + 24,
+                line + 16,
+                &format!("  state: {}", link.state.label()),
+                rgb(180, 180, 200),
+            );
+            if let Some(mac) = link.mac {
+                draw_line(
+                    fb,
+                    x + 24,
+                    line + 32,
+                    &format!("  MAC:   {}", wifi::format_mac(mac)),
+                    rgb(160, 160, 176),
+                );
+            }
+            if let Some(ip) = link.ip {
+                draw_line(
+                    fb,
+                    x + 24,
+                    line + 48,
+                    &format!("  IP:    {}", wifi::format_ip(ip)),
+                    rgb(160, 180, 220),
+                );
+            }
+            if let Some(gw) = link.gateway {
+                draw_line(
+                    fb,
+                    x + 24,
+                    line + 64,
+                    &format!("  GW:    {}", wifi::format_ip(gw)),
+                    rgb(160, 160, 176),
+                );
+            }
+            line += 80;
+        }
+    }
+
+    // Traffic stats panel
+    let stats = net::device::stats();
+    let stats_y = y + h - 64;
+    draw::fill_rect(fb, x + 8, stats_y, w - 16, 56, rgb(20, 20, 28));
+    draw::draw_rect_outline(fb, x + 8, stats_y, w - 16, 56, rgb(60, 60, 80));
+    draw_line(fb, x + 16, stats_y + 6, "Traffic", rgb(120, 180, 255));
+    draw_line(
+        fb,
+        x + 16,
+        stats_y + 24,
+        &format!(
+            "RX: {} ({} pkt)   TX: {} ({} pkt)",
+            wifi::format_bytes(stats.rx_bytes),
+            stats.rx_packets,
+            wifi::format_bytes(stats.tx_bytes),
+            stats.tx_packets,
+        ),
+        rgb(210, 210, 220),
+    );
+}
+
+fn draw_button(
+    fb: &Framebuffer,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    label: &str,
+    color: u32,
+    action: NetAction,
+) {
+    draw::fill_rect(fb, x, y, w, h, color);
+    draw::draw_rect_outline(fb, x, y, w, h, rgb(220, 220, 240));
+    let tw = text_width(label);
+    let tx = x + (w.saturating_sub(tw)) / 2;
+    let ty = y + (h.saturating_sub(16)) / 2;
+    draw::draw_text(fb, tx, ty, label, rgb(245, 245, 250), None);
+    NET_HOTSPOTS.lock().push(Hotspot { x, y, w, h, action });
 }
 
 fn draw_launcher(fb: &Framebuffer) {
@@ -269,7 +432,7 @@ fn draw_launcher(fb: &Framebuffer) {
         ("Settings", AppId::Settings),
         ("Browser", AppId::Browser),
         ("Files", AppId::Files),
-        ("Wi-Fi", AppId::Wifi),
+        ("Network", AppId::Wifi),
     ];
     let tile_w = 110u32;
     let tile_h = 90u32;
@@ -318,7 +481,7 @@ pub fn taskbar_label() -> &'static str {
         AppId::Settings => "Settings",
         AppId::Browser => "Browser",
         AppId::Files => "Files",
-        AppId::Wifi => "Wi-Fi",
+        AppId::Wifi => "Network",
     }
 }
 
@@ -326,11 +489,25 @@ pub fn shell_open(name: &str) -> bool {
     let app = match name {
         "console" | "term" => AppId::Console,
         "settings" | "setting" => AppId::Settings,
-        "browser" | "firefox" | "web" => AppId::Browser,
+        "browser" | "web" => AppId::Browser,
         "files" | "file" | "explorer" => AppId::Files,
-        "wifi" | "wireless" => AppId::Wifi,
+        "wifi" | "wireless" | "network" | "net" => AppId::Wifi,
         _ => return false,
     };
     open(app);
     true
+}
+
+/// Used by the in-kernel shell to report network status as text.
+pub fn shell_network_status() -> String {
+    let mut s = wifi::status_line();
+    let stats = net::device::stats();
+    s.push_str(&format!(
+        "\nRX {} ({} pkt) / TX {} ({} pkt)",
+        wifi::format_bytes(stats.rx_bytes),
+        stats.rx_packets,
+        wifi::format_bytes(stats.tx_bytes),
+        stats.tx_packets,
+    ));
+    s
 }

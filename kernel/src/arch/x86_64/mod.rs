@@ -17,6 +17,7 @@ pub mod ioapic;
 pub mod lapic;
 pub mod pic;
 pub mod port;
+pub mod rtc;
 pub mod smp;
 pub mod trampoline;
 pub mod tss;

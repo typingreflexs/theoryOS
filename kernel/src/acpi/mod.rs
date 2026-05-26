@@ -7,6 +7,7 @@ pub mod madt;
 pub mod fadt;
 pub mod dsdt;
 pub mod srat;
+pub mod power;
 
 use spin::Once;
 

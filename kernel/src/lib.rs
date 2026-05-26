@@ -21,23 +21,24 @@
 
 extern crate alloc;
 
-pub mod fs;
-pub mod signal;
-pub mod syscall;
-pub mod proc;
-pub mod sched;
 pub mod acpi;
 pub mod arch;
+pub mod audio;
 pub mod boot;
 pub mod console;
+pub mod fs;
 pub mod input;
-pub mod video;
+pub mod ipc;
 pub mod mm;
 pub mod net;
 pub mod panic;
-pub mod ipc;
+pub mod proc;
+pub mod sched;
 pub mod security;
+pub mod signal;
 pub mod sync;
+pub mod syscall;
+pub mod video;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -65,11 +66,16 @@ pub fn kernel_main(boot: BootInfo) -> ! {
     arch::early_init();   // CPU segments, TSS, serial-ready arch state
     mm::init();           // Physical memory, page tables, kernel heap
     acpi::init();         // ACPI table discovery and parsing
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::rtc::init(); // Real-time clock baseline (depends on FADT)
     video::init();        // Linear framebuffer + desktop UI
     security::init();     // Hardening: KPTI, canaries, seccomp framework
     fs::init();           // VFS mounts and embedded userspace files
     ipc::init();          // Inter-process communication primitives
     net::init();          // TCP/UDP/ARP/DHCP stack (no NIC probe yet)
+    audio::init();        // PC speaker + Intel HDA enumeration
+    fs::block::ahci::probe(); // SATA disks (no-op if none)
+    fs::block::nvme::probe(); // NVMe SSDs (no-op if none)
     syscall::init();      // Fast userspace entry via SYSCALL instruction
     arch::apic_init();    // Local APIC + IOAPIC
     arch::post_acpi_init() // SMP, scheduler, idle/UI loop — does not return

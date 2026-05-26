@@ -81,6 +81,17 @@ pub struct Fadt {
     pm_timer_length: u8,
     dsdt_phys: Option<PhysAddr>,
     flags: u32,
+    pm1a_cnt_blk: u32,
+    pm1b_cnt_blk: u32,
+    century_register: u8,
+    reset_register: Option<ResetRegister>,
+    reset_value: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ResetRegister {
+    pub address_space: u8,
+    pub address: u64,
 }
 
 impl Fadt {
@@ -103,14 +114,62 @@ impl Fadt {
                 None
             };
 
+            let reset_register = if header.length as usize >= core::mem::size_of::<FadtHeader>()
+                && header.reset_reg.address != 0
+            {
+                Some(ResetRegister {
+                    address_space: header.reset_reg.address_space,
+                    address: header.reset_reg.address,
+                })
+            } else {
+                None
+            };
+
             Self {
                 hhdm,
                 pm_timer_block: pm_timer,
                 pm_timer_length: header.pm_tmr_len,
                 dsdt_phys,
                 flags: header.flags,
+                pm1a_cnt_blk: header.pm1a_cnt_blk,
+                pm1b_cnt_blk: header.pm1b_cnt_blk,
+                century_register: header.century,
+                reset_register,
+                reset_value: header.reset_value,
             }
         }
+    }
+
+    pub fn pm1a_cnt_blk(&self) -> Option<u16> {
+        if self.pm1a_cnt_blk != 0 {
+            Some(self.pm1a_cnt_blk as u16)
+        } else {
+            None
+        }
+    }
+
+    pub fn pm1b_cnt_blk(&self) -> Option<u16> {
+        if self.pm1b_cnt_blk != 0 {
+            Some(self.pm1b_cnt_blk as u16)
+        } else {
+            None
+        }
+    }
+
+    pub fn century_register(&self) -> Option<u8> {
+        if self.century_register != 0 {
+            Some(self.century_register)
+        } else {
+            None
+        }
+    }
+
+    pub fn reset_register(&self) -> Option<ResetRegister> {
+        self.reset_register
+    }
+
+    pub fn reset_value(&self) -> u8 {
+        self.reset_value
     }
 
     pub fn dsdt_address(&self) -> Option<PhysAddr> {

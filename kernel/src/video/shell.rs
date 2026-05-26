@@ -143,13 +143,20 @@ fn run_command(cmd: &str, term: &mut Terminal) {
             term.push_str("  pwd      — working directory");
             term.push_str("  ls       — list root entries");
             term.push_str("  uname    — system name");
-            term.push_str("  date     — date and time");
+            term.push_str("  date     — RTC date and time");
+            term.push_str("  uptime   — kernel uptime");
             term.push_str("  version  — OS version");
-            term.push_str("  open     — open app (settings/browser/files/wifi)");
+            term.push_str("  open     — open app (settings/browser/files/network)");
             term.push_str("  apps     — open Start menu");
             term.push_str("  fetch    — download http:// page");
             term.push_str("  ping     — ping host");
-            term.push_str("  wifi     — network status");
+            term.push_str("  wifi/net — network status");
+            term.push_str("  ifconfig — list network links");
+            term.push_str("  disks    — list block devices");
+            term.push_str("  audio    — list audio codecs");
+            term.push_str("  beep     — PC speaker beep");
+            term.push_str("  shutdown — power off (ACPI S5)");
+            term.push_str("  reboot   — restart machine");
         }
         "whoami" => term.push_str("root"),
         "clear" => term.clear_screen(),
@@ -166,21 +173,102 @@ fn run_command(cmd: &str, term: &mut Terminal) {
         }
         "uname" => term.push_str("Theory OS x86_64"),
         "date" | "time" => {
+            let secs = crate::arch::x86_64::rtc::unix_now();
+            let line = alloc::format!(
+                "{} UTC ({})",
+                crate::arch::x86_64::rtc::format_unix(secs),
+                secs
+            );
+            term.push_str(&line);
+        }
+        "uptime" => {
             let mut buf = [0u8; 32];
             let text = format_datetime(&mut buf);
             term.push_line(text.as_bytes());
+        }
+        "disks" => {
+            let ahci = crate::fs::block::ahci::port_count();
+            let nvme = crate::fs::block::nvme::controller_count();
+            term.push_str(&alloc::format!(
+                "AHCI ports: {}   NVMe controllers: {}",
+                ahci, nvme
+            ));
+            if ahci == 0 && nvme == 0 {
+                term.push_str("(only ramdisks /mnt/ext2 and /mnt/fat32 available)");
+            }
+        }
+        "audio" => {
+            let codecs = crate::audio::hda::codecs();
+            if codecs.is_empty() {
+                term.push_str("HDA: no codecs (PC speaker available)");
+            } else {
+                for c in codecs {
+                    term.push_str(&alloc::format!(
+                        "HDA codec {}: vendor={:04X} device={:04X} outputs={}",
+                        c.address, c.vendor, c.device, c.output_count
+                    ));
+                }
+            }
+        }
+        "beep" => {
+            crate::audio::beep();
+            term.push_str("(beep)");
+        }
+        "shutdown" | "poweroff" | "halt" => {
+            term.push_str("Shutting down...");
+            crate::acpi::power::shutdown();
+            term.push_str("ACPI shutdown not available — halting.");
+            crate::arch::halt_forever();
+        }
+        "reboot" | "restart" => {
+            term.push_str("Rebooting...");
+            crate::acpi::power::reboot();
         }
         "version" => term.push_str("Theory OS 0.1.0 (Limine + Rust kernel)"),
         "apps" | "start" | "menu" => {
             crate::video::apps::toggle_launcher();
             crate::video::apps::mark_dirty();
         }
-        "wifi" | "net" => {
+        "wifi" | "net" | "network" => {
             crate::video::apps::init_network_once();
-            let msg = crate::net::wifi::status_line();
-            term.push_str(&msg);
+            let msg = crate::video::apps::shell_network_status();
+            for line in msg.split('\n') {
+                term.push_str(line);
+            }
         }
-        "fetch" => {
+        "ifconfig" | "ip" => {
+            for link in crate::net::wifi::links() {
+                term.push_str(&link.label);
+                term.push_str(&alloc::format!("  state: {}", link.state.label()));
+                if let Some(mac) = link.mac {
+                    term.push_str(&alloc::format!(
+                        "  ether: {}",
+                        crate::net::wifi::format_mac(mac)
+                    ));
+                }
+                if let Some(ip) = link.ip {
+                    term.push_str(&alloc::format!(
+                        "  inet:  {}",
+                        crate::net::wifi::format_ip(ip)
+                    ));
+                }
+                if let Some(gw) = link.gateway {
+                    term.push_str(&alloc::format!(
+                        "  gw:    {}",
+                        crate::net::wifi::format_ip(gw)
+                    ));
+                }
+            }
+        }
+        "connect" => {
+            crate::net::wifi::connect();
+            term.push_str("Connecting...");
+        }
+        "disconnect" => {
+            crate::net::wifi::disconnect();
+            term.push_str("Disconnected.");
+        }
+        "fetch" | "curl" | "wget" => {
             if args.is_empty() {
                 term.push_str("Usage: fetch http://example.com");
             } else {
