@@ -1,0 +1,83 @@
+pub mod syscall;
+#[cfg(not(test))]
+pub mod asm;
+pub mod context;
+pub mod cpu;
+pub mod entry;
+pub mod features;
+pub mod gdt;
+pub mod idt;
+pub mod interrupts;
+pub mod ioapic;
+pub mod lapic;
+pub mod pic;
+pub mod port;
+pub mod smp;
+pub mod trampoline;
+pub mod tss;
+pub mod xsave;
+
+use spin::Once;
+
+use crate::acpi::AcpiContext;
+use crate::arch::traits::Arch;
+use crate::console::Console;
+
+static ACPI_CTX: Once<()> = Once::new();
+
+pub struct X86_64;
+
+impl Arch for X86_64 {
+    fn early_init() {
+        cpu::disable_interrupts();
+        cpu::verify_long_mode();
+        gdt::init_bsp();
+        tss::init_bsp();
+        gdt::load_tss_bsp();
+        pic::disable_legacy_pic();
+        features::init();
+        Console::println("[x86_64] early init complete (GDT/TSS/PIC)");
+    }
+
+    fn interrupt_init() {
+        idt::init();
+        idt::load();
+        Console::println("[x86_64] IDT loaded (256 vectors)");
+    }
+
+    fn apic_init() {
+        lapic::init_bsp();
+        Console::println("[x86_64] local APIC online");
+    }
+
+    fn smp_init() -> ! {
+        smp::bootstrap_application_processors()
+    }
+
+    fn halt_forever() -> ! {
+        cpu::halt_forever()
+    }
+
+    fn current_cpu_id() -> u32 {
+        smp::current_cpu_index()
+    }
+
+    fn bsp_lapic_id() -> u32 {
+        smp::bsp_lapic_id()
+    }
+
+    fn init_per_cpu(cpu_index: u32, lapic_id: u32) {
+        gdt::init_ap(cpu_index);
+        tss::init_ap(cpu_index);
+        gdt::load_tss_ap(cpu_index);
+        idt::load();
+        lapic::init_ap(lapic_id);
+        // Interrupts stay off until sched::start_cpu sets rsp0 and starts the timer.
+    }
+
+    fn load_acpi_context(ctx: &'static AcpiContext) {
+        let _ = ACPI_CTX.call_once(|| {
+            ioapic::discover_from_acpi(ctx);
+        });
+    }
+}

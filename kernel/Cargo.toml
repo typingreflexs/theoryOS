@@ -1,0 +1,22 @@
+[package]
+name = "theory-kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["THE OS Project"]
+
+[dependencies]
+bitflags = { version = "2", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["mutex", "once", "lazy", "spin_mutex"] }
+
+[features]
+default = ["arch-x86_64"]
+arch-x86_64 = []
+arch-aarch64 = []
+
+[lib]
+name = "theory_kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "theory-kernel"
+path = "src/main.rs"
